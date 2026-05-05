@@ -1,7 +1,7 @@
 import numpy as np
 import time
 import threading
-from mouse import Mouse, is_button_pressed  # Use the thread-safe function
+from mouse import Mouse, is_button_pressed, enable_aimbot_lock, disable_aimbot_lock, tick_movement_lock_manager  # Use the thread-safe function
 from capture import get_camera
 from detection import load_model, perform_detection
 from config import config
@@ -244,6 +244,13 @@ def detection_and_aim_loop():
 
         # --- Target Selection and Aiming (Only when button is held) ---
         button_held = is_button_pressed(config.selected_mouse_button)
+
+        # 🔒 Mouse Lock: включаем при начале прицеливания
+        if config.mouse_lock_enabled and button_held and all_targets:
+            enable_aimbot_lock(lock_x=config.mouse_lock_x, lock_y=config.mouse_lock_y)
+        elif config.mouse_lock_enabled and not (button_held and all_targets):
+            disable_aimbot_lock()
+        
         if all_targets and button_held:
             best_target = min(all_targets, key=lambda t: t['dist'])
 
@@ -300,6 +307,10 @@ def detection_and_aim_loop():
                     makcu.move(dx, dy)
 
         elif all_targets and config.always_on_aim:
+            # 🔒 Mouse Lock для always_on_aim
+            if config.mouse_lock_enabled:
+                enable_aimbot_lock(lock_x=config.mouse_lock_x, lock_y=config.mouse_lock_y)
+                
             best_target = min(all_targets, key=lambda t: t['dist'])
 
             target_screen_x = region_left + best_target['center_x']
@@ -356,6 +367,10 @@ def detection_and_aim_loop():
                     print("[DEBUG] No smooth path generated, using direct movement")
                     makcu.move(dx, dy)
         else:
+            # 🔒 Отключаем блокировку, если не прицеливаемся
+            if config.mouse_lock_enabled:
+                disable_aimbot_lock()
+                
             # Reset fatigue when not aiming
             smooth_aimer.reset_fatigue()
         try:
@@ -468,6 +483,10 @@ def detection_and_aim_loop():
                 debug_window_moved = True
             cv2.waitKey(1)
 
+        # 🔒 Вызов менеджера блокировок — ОБЯЗАТЕЛЬНО в конце каждого тика
+        if config.mouse_lock_enabled:
+            tick_movement_lock_manager(timeout_override=config.mouse_lock_timeout)
+        
         # --- FPS Calculation ---
         frame_count += 1
         elapsed = time.perf_counter() - start_time
