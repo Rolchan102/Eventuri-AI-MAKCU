@@ -6,6 +6,7 @@ from capture import get_camera
 from detection import load_model, perform_detection
 from config import config
 from windmouse_smooth import smooth_aimer
+from jitter import JitterController
 import os
 import math
 import cv2
@@ -23,6 +24,10 @@ smooth_move_queue = queue.Queue(maxsize=10)  # Queue for smooth movements
 makcu = None  # <-- Declare Mouse instance globally, will be initialized once
 _last_trigger_time_ms = 0.0
 _in_zone_since_ms = 0.0
+_target_history = {'x': 0.0, 'y': 0.0, 'smooth_x': 0.0, 'smooth_y': 0.0, 'active': False}
+SMOOTH_ALPHA = 0.65  # 0.0 = полное сглаживание, 1.0 = без сглаживания
+jitter_controller = None
+
 
 def smooth_movement_loop():
     """
@@ -36,7 +41,6 @@ def smooth_movement_loop():
             # Get next movement from queue (blocking with timeout)
             move_data = smooth_move_queue.get(timeout=0.1)
             dx, dy, delay = move_data
-
 
             # Execute the movement
             makcu.move(dx, dy)
@@ -54,8 +58,10 @@ def smooth_movement_loop():
 
     print("[INFO] Smooth movement thread stopped")
 
+
 def _now_ms():
     return time.perf_counter() * 1000.0
+
 
 def capture_loop():
     """PRODUCER: This loop runs on a dedicated CPU thread."""
@@ -82,10 +88,14 @@ def capture_loop():
                 try:
                     frame_queue.put(image, block=False)
                 except queue.Full:
-                    try: frame_queue.get_nowait()
-                    except queue.Empty: pass
-                    try: frame_queue.put(image, block=False)
-                    except queue.Full: pass
+                    try:
+                        frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        frame_queue.put(image, block=False)
+                    except queue.Full:
+                        pass
 
         except Exception as e:
             print(f"[ERROR] Capture loop failed: {e}")
@@ -97,12 +107,12 @@ def capture_loop():
         print(f"[ERROR] Camera stop failed: {e}")
     print("[INFO] Capture loop stopped.")
 
+
 def detection_and_aim_loop():
     """CONSUMER: This loop runs on the main aimbot thread, utilizing the GPU."""
     global _aimbot_running, fps, makcu
     model, class_names = load_model(config.model_path)
     # makcu is already initialized in start_aimbot
-
 
     frame_count = 0
     start_time = time.perf_counter()  # Use a more precise clock
@@ -116,12 +126,12 @@ def detection_and_aim_loop():
             continue
         if config.capturer_mode.lower() == "mss":
             region_left = (config.screen_width - config.region_size) // 2
-            region_top  = (config.screen_height - config.region_size) // 2
+            region_top = (config.screen_height - config.region_size) // 2
             crosshair_x = config.screen_width // 2
             crosshair_y = config.screen_height // 2
         else:
             region_left = (config.main_pc_width - config.ndi_width) // 2
-            region_top  = (config.main_pc_height - config.ndi_height) // 2
+            region_top = (config.main_pc_height - config.ndi_height) // 2
             crosshair_x = config.main_pc_width // 2
             crosshair_y = config.main_pc_height // 2
         if config.button_mask:
@@ -131,7 +141,6 @@ def detection_and_aim_loop():
             Mouse.mask_manager_tick(selected_idx=config.selected_mouse_button, aimbot_running=False)
             Mouse.mask_manager_tick(selected_idx=config.trigger_button, aimbot_running=False)
 
-        
         all_targets = []
         debug_image = image.copy() if config.show_debug_window else None
         detected_classes = set()  # Track what classes are being detected
@@ -155,8 +164,6 @@ def detection_and_aim_loop():
 
                     # Debug: Track all detected classes
                     detected_classes.add(class_name)
-
-
 
                     # Check if this detection should be a target
                     is_target = False
@@ -201,26 +208,19 @@ def detection_and_aim_loop():
                         center_x = (x1 + x2) / 2
                         center_y = (y1 + y2) / 2
 
-                        # Adjust for headshot
-                        if target_type == "player":
-                            center_x = (x1 + x2) / 2
-                            center_y = y1 + config.player_y_offset
-
                         # Calculate distance from crosshair
                         if config.capturer_mode.lower() == "mss":
                             dist = math.hypot(center_x - (config.region_size / 2), center_y - (config.region_size / 2))
                         else:
                             dist = math.hypot(center_x - (config.ndi_width / 2), center_y - (config.ndi_height / 2))
                         all_targets.append({
-                            'dist': dist, 
-                            'center_x': center_x, 
+                            'dist': dist,
+                            'center_x': center_x,
                             'center_y': center_y,
                             'type': target_type,
                             'class': class_name,
                             'conf': conf
                         })
-
-                        
 
                     # Draw debug boxes
                     if debug_image is not None:
@@ -240,7 +240,7 @@ def detection_and_aim_loop():
                         if is_target:
                             label += f" [{target_type.upper()}]"
 
-                        cv2.putText(debug_image, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        cv2.putText(debug_image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         # --- Target Selection and Aiming (Only when button is held) ---
         button_held = is_button_pressed(config.selected_mouse_button)
@@ -260,10 +260,7 @@ def detection_and_aim_loop():
             dx *= distance
             dy *= distance
 
-
-           
             if config.mode == "normal":
-                # Apply x,y speeds scaling
                 dx *= config.normal_x_speed
                 dy *= config.normal_y_speed
                 makcu.move(dx, dy)
@@ -273,7 +270,6 @@ def detection_and_aim_loop():
                 makcu.move_bezier(dx, dy, config.silent_segments, config.silent_ctrl_x, config.silent_ctrl_y)
             elif config.mode == "smooth":
                 # Use smooth aiming with WindMouse algorithm
-                
                 path = smooth_aimer.calculate_smooth_path(dx, dy, config)
 
                 # Add all movements to the smooth movement queue
@@ -319,8 +315,6 @@ def detection_and_aim_loop():
             dx *= distance
             dy *= distance
 
-
-           
             if config.mode == "normal":
                 # Apply x,y speeds scaling
                 dx *= config.normal_x_speed
@@ -332,10 +326,8 @@ def detection_and_aim_loop():
                 makcu.move_bezier(dx, dy, config.silent_segments, config.silent_ctrl_x, config.silent_ctrl_y)
             elif config.mode == "smooth":
                 # Use smooth aiming with WindMouse algorithm
-                
+
                 path = smooth_aimer.calculate_smooth_path(dx, dy, config)
-
-
 
                 # Add all movements to the smooth movement queue
                 movements_added = 0
@@ -376,20 +368,20 @@ def detection_and_aim_loop():
 
                 # only evaluate when active
                 if trigger_active and all_targets:
-                    min_conf    = float(getattr(config, "trigger_min_conf", 0.35))
-                    radius_px   = int(getattr(config, "trigger_radius_px", 8))
+                    min_conf = float(getattr(config, "trigger_min_conf", 0.35))
+                    radius_px = int(getattr(config, "trigger_radius_px", 8))
                     delay_ms = int(getattr(config, "trigger_delay_ms", 30) * random.uniform(0.8, 1.2))
                     cooldown_ms = int(getattr(config, "trigger_cooldown_ms", 120) * random.uniform(0.8, 1.2))
 
                     # candidates: within radius and above confidence
                     candidates = [t for t in all_targets
-                                if (t['conf'] >= min_conf and t['dist'] <= radius_px)]
+                                  if (t['conf'] >= min_conf and t['dist'] <= radius_px)]
 
                     now = _now_ms()
                     global _in_zone_since_ms, _last_trigger_time_ms
 
                     if candidates:
-                        
+
                         if _in_zone_since_ms == 0.0:
                             _in_zone_since_ms = now
 
@@ -403,7 +395,7 @@ def detection_and_aim_loop():
                             except Exception as e:
                                 print(f"[WARN] Trigger click failed: {e}")
                             _last_trigger_time_ms = now
-                            _in_zone_since_ms = 0.0  
+                            _in_zone_since_ms = 0.0
                     else:
                         _in_zone_since_ms = 0.0
                 else:
@@ -411,7 +403,23 @@ def detection_and_aim_loop():
         except Exception as e:
             print(f"[ERROR] Triggerbot block: {e}")
 
-            
+        if getattr(config, 'jitter_enabled', False) and jitter_controller:
+            # Триггер: ЛКМ (0) + ПКМ (1) одновременно
+            lmb_pressed = is_button_pressed(0)
+            rmb_pressed = is_button_pressed(1)
+
+            if lmb_pressed and rmb_pressed:
+                # Запустить, если ещё не активен
+                if not jitter_controller.is_active:
+                    jitter_controller.update_params()  # обновить параметры на лету
+                    jitter_controller.start()
+                    print("[JITTER] Activated (LMB+RMB)")
+            else:
+                # Остановить, если активен
+                if jitter_controller.is_active:
+                    jitter_controller.stop()
+                    print("[JITTER] Deactivated")
+
         # --- Debug Window Display ---
         if debug_image is not None:
             # Add overlays (same as before)
@@ -435,7 +443,8 @@ def detection_and_aim_loop():
 
             if detected_classes:
                 classes_text = f"Classes: {', '.join(sorted(detected_classes))}"
-                cv2.putText(debug_image, classes_text, (10, debug_image.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                cv2.putText(debug_image, classes_text, (10, debug_image.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                            (200, 200, 200), 1)
 
             # Draw crosshair
             if config.capturer_mode.lower() == "mss":
@@ -456,9 +465,8 @@ def detection_and_aim_loop():
                 x = (screen_w - win_w) // 2
                 y = (screen_h - win_h) // 2
                 cv2.moveWindow(win_name, x, y)
-                debug_window_moved = True 
+                debug_window_moved = True
             cv2.waitKey(1)
-
 
         # --- FPS Calculation ---
         frame_count += 1
@@ -468,8 +476,9 @@ def detection_and_aim_loop():
             start_time = time.perf_counter()
             frame_count = 0
 
+
 def start_aimbot():
-    global _aimbot_running, _aimbot_thread, _capture_thread, _smooth_thread, makcu
+    global _aimbot_running, _aimbot_thread, _capture_thread, _smooth_thread, makcu, jitter_controller
     global _last_trigger_time_ms, _in_zone_since_ms
     _last_trigger_time_ms = 0.0
     _in_zone_since_ms = 0.0
@@ -478,7 +487,7 @@ def start_aimbot():
     try:
         if makcu is None:  # <-- Initialize only once
             Mouse.cleanup()
-            makcu=Mouse()
+            makcu = Mouse()
     except Exception as e:
         print(f"[ERROR] Failed to cleanup Mouse instance: {e}")
 
@@ -496,16 +505,26 @@ def start_aimbot():
     _aimbot_thread.start()
 
     button_names = ["Left", "Right", "Middle", "Side 4", "Side 5"]
-    button_name = button_names[config.selected_mouse_button] if config.selected_mouse_button < len(button_names) else f"Button {config.selected_mouse_button}"
+    button_name = button_names[config.selected_mouse_button] if config.selected_mouse_button < len(
+        button_names) else f"Button {config.selected_mouse_button}"
     print(f"[INFO] Aimbot started in {config.mode} mode. Hold {button_name} button to aim.")
 
+    # Инициализация Jitter
+    if jitter_controller is None:
+        jitter_controller = JitterController(makcu)
+
+
 def stop_aimbot():
-    global _aimbot_running, _last_trigger_time_ms, _in_zone_since_ms
+    global _aimbot_running, _last_trigger_time_ms, _in_zone_since_ms, jitter_controller
     _aimbot_running = False
     _last_trigger_time_ms = 0.0
     _in_zone_since_ms = 0.0
     Mouse.mask_manager_tick(selected_idx=config.selected_mouse_button, aimbot_running=False)
     Mouse.mask_manager_tick(selected_idx=config.trigger_button, aimbot_running=False)
+
+    if jitter_controller:
+        jitter_controller.stop()
+
     try:
         if makcu is None:  # <-- Initialize only once
             Mouse.cleanup()
@@ -525,25 +544,30 @@ def stop_aimbot():
             pass  # Ignore errors if window was already closed
     print("[INFO] Aimbot stopped.")
 
+
 def is_aimbot_running():
     return _aimbot_running
+
 
 # Rest of the utility functions remain the same
 def reload_model(path=None):
     if path is None: path = config.model_path
     return load_model(path)
 
+
 def get_model_classes(path=None):
     if path is None: path = config.model_path
     _, class_names = load_model(path)
     return [class_names[i] for i in sorted(class_names.keys())]
 
+
 def get_model_size(path=None):
     if path is None: path = config.model_path
     try:
-        return f"{os.path.getsize(path) / (1024*1024):.2f} MB"
+        return f"{os.path.getsize(path) / (1024 * 1024):.2f} MB"
     except Exception:
         return "?"
+
 
 __all__ = [
     'start_aimbot', 'stop_aimbot', 'is_aimbot_running', 'reload_model',
