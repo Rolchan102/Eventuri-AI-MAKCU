@@ -1,12 +1,13 @@
 import os
 import customtkinter as ctk
+from rcs import rcs_controller
 from tkinter import messagebox
 from config import config
 from mouse import Mouse,connect_to_makcu, test_move
 import main
 from main import (
     start_aimbot, stop_aimbot, is_aimbot_running,
-    reload_model, get_model_classes, get_model_size
+    reload_model, get_model_classes, get_model_size, jitter_controller
 )
 import glob
 from gui_sections import *
@@ -222,6 +223,12 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
         
         # Class Selection
         self.build_class_selection(self.right_column, row)
+        row += 1
+
+        self.build_rcs_settings(self.right_column, row)
+        row += 1
+
+        self.build_jitter_settings(self.right_column, row)
         row += 1
 
         # Triggerbot section here
@@ -714,6 +721,7 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
         for i, txt in enumerate(["Left", "Right", "Middle", "Side 4", "Side 5"]):
             ctk.CTkRadioButton(btn_frame, text=txt, variable=self.btn_var, value=i, command=self.update_mouse_btn, text_color="#fff").pack(side="left", padx=8)
 
+
     def build_aimbot_mode(self, parent, row):
         """Aimbot mode selection"""
         frame = ctk.CTkFrame(parent, fg_color="#1a1a1a")
@@ -958,6 +966,21 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
             self.main_res_h_entry.delete(0, "end"); self.main_res_h_entry.insert(0, str(config.main_pc_height))
         except Exception:
             pass
+
+        # === Jitter (makcu-apex) sync ===
+        try:
+            self.jitter_interval_slider.set(config.jitter_interval)
+            self.jitter_interval_label.configure(text=f"{config.jitter_interval:.3f}")
+            self.hipfire_slider.set(config.hipfire_sens)
+            self.hipfire_label.configure(text=f"{config.hipfire_sens:.2f}")
+            self.ads_slider.set(config.ads_sens)
+            self.ads_label.configure(text=f"{config.ads_sens:.2f}")
+            self.fine_tune_slider.set(config.fine_tune_offset)
+            self.fine_tune_label.configure(text=str(config.fine_tune_offset))
+            self.rcs_jitter_enabled_var.set(bool(getattr(config, "jitter_enabled", False)))
+            self.makcu_jitter_enabled_var.set(bool(getattr(config, "jitter_enabled", False)))
+        except Exception:
+            pass  # На случай, если виджеты ещё не созданы
 
 
     def on_capture_mode_change(self, value: str):
@@ -1514,6 +1537,228 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
     def _on_input_check_close(self):
         self.input_check_var.set(False)
         self.hide_input_check_window()
+
+    def build_rcs_settings(self, parent, row):
+        """RCS/Jitter Settings section"""
+        frame = ctk.CTkFrame(parent, fg_color="#1a1a1a")
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(frame, text="🔫 RCS / Jitter",
+                     font=("Segoe UI", 16, "bold"),
+                     text_color="#00e676").grid(row=0, column=0,
+                                                pady=(15, 10),
+                                                padx=15,
+                                                sticky="w")
+
+        # Toggles
+        toggles = ctk.CTkFrame(frame, fg_color="transparent")
+        toggles.grid(row=1, column=0, sticky="ew", padx=15, pady=(0, 10))
+
+        self.rcs_enabled_var = ctk.BooleanVar(value=bool(getattr(config, "rcs_enabled", False)))
+        ctk.CTkSwitch(toggles, text="RCS Enabled",
+                      text_color="#fff",
+                      variable=self.rcs_enabled_var,
+                      command=self.on_rcs_enabled_toggle).pack(side="left", padx=(0, 15))
+
+        self.rcs_jitter_enabled_var = ctk.BooleanVar(value=bool(getattr(config, "jitter_enabled", True)))
+        ctk.CTkSwitch(toggles, text="Jitter Enabled",
+                      text_color="#fff",
+                      variable=self.rcs_jitter_enabled_var,
+                      command=self.on_jitter_enabled_toggle).pack(side="left")
+
+
+    def build_jitter_settings(self, parent, row):
+        """Jitter settings (makcu-apex style)"""
+        frame = ctk.CTkFrame(parent, fg_color="#1a1a1a")
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(frame, text="🔁 Jitter",
+                     font=("Segoe UI", 16, "bold"),
+                     text_color="#00e676").grid(row=0, column=0, columnspan=2,
+                                                pady=(15, 10), padx=15, sticky="w")
+
+        # Toggle
+        self.makcu_jitter_enabled_var = ctk.BooleanVar(value=bool(getattr(config, "jitter_enabled", False)))
+        ctk.CTkSwitch(frame, text="Enable Jitter",
+                      variable=self.makcu_jitter_enabled_var,
+                      command=self.on_jitter_toggle,
+                      text_color="#fff").grid(row=1, column=0, sticky="w", padx=15, pady=5)
+
+        # Settings grid
+        settings = ctk.CTkFrame(frame, fg_color="#2a2a2a", corner_radius=10)
+        settings.grid(row=2, column=0, columnspan=2, sticky="ew", padx=15, pady=(5, 15))
+        settings.grid_columnconfigure(1, weight=1)
+
+        # Interval
+        ctk.CTkLabel(settings, text="Interval (s):", text_color="#fff").grid(row=0, column=0, sticky="w", padx=10,
+                                                                             pady=8)
+        self.jitter_interval_slider = ctk.CTkSlider(settings, from_=0.005, to=0.05, number_of_steps=45,
+                                                    command=self.update_jitter_interval)
+        self.jitter_interval_slider.grid(row=0, column=1, sticky="ew", padx=(5, 10), pady=8)
+        self.jitter_interval_label = ctk.CTkLabel(settings, text=f"{config.jitter_interval:.3f}",
+                                                  text_color=NEON, width=50)
+        self.jitter_interval_label.grid(row=0, column=2, padx=5)
+
+        # Hipfire Sens
+        ctk.CTkLabel(settings, text="Hipfire Sens:", text_color="#fff").grid(row=1, column=0, sticky="w", padx=10,
+                                                                             pady=8)
+        self.hipfire_slider = ctk.CTkSlider(settings, from_=0.5, to=3.0, number_of_steps=25,
+                                            command=self.update_hipfire_sens)
+        self.hipfire_slider.grid(row=1, column=1, sticky="ew", padx=(5, 10), pady=8)
+        self.hipfire_label = ctk.CTkLabel(settings, text=f"{config.hipfire_sens:.2f}",
+                                          text_color=NEON, width=50)
+        self.hipfire_label.grid(row=1, column=2, padx=5)
+
+        # ADS Sens
+        ctk.CTkLabel(settings, text="ADS Sens:", text_color="#fff").grid(row=2, column=0, sticky="w", padx=10, pady=8)
+        self.ads_slider = ctk.CTkSlider(settings, from_=0.5, to=3.0, number_of_steps=25,
+                                        command=self.update_ads_sens)
+        self.ads_slider.grid(row=2, column=1, sticky="ew", padx=(5, 10), pady=8)
+        self.ads_label = ctk.CTkLabel(settings, text=f"{config.ads_sens:.2f}",
+                                      text_color=NEON, width=50)
+        self.ads_label.grid(row=2, column=2, padx=5)
+
+        # Fine Tune
+        ctk.CTkLabel(settings, text="Fine Tune:", text_color="#fff").grid(row=3, column=0, sticky="w", padx=10,
+                                                                          pady=(8, 15))
+        self.fine_tune_slider = ctk.CTkSlider(settings, from_=-5, to=5, number_of_steps=10,
+                                              command=self.update_fine_tune)
+        self.fine_tune_slider.grid(row=3, column=1, sticky="ew", padx=(5, 10), pady=(8, 15))
+        self.fine_tune_label = ctk.CTkLabel(settings, text=str(config.fine_tune_offset),
+                                            text_color=NEON, width=50)
+        self.fine_tune_label.grid(row=3, column=2, padx=5)
+
+        # Info label
+        ctk.CTkLabel(frame, text="🎯 Trigger: Hold LMB + RMB together",
+                     font=("Segoe UI", 10), text_color="#888").grid(row=3, column=0,
+                                                                    columnspan=2,
+                                                                    padx=15, pady=(0, 10),
+                                                                    sticky="w")
+
+    # Callback методы:
+    def get_rcs_weapons(self, game="apex"):
+        """Получить список доступных паттернов оружия из recoil_data"""
+        import os
+        weapons = []
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base_dir, "..", "recoil_data", game)
+        path = os.path.normpath(path)
+
+        if os.path.exists(path):
+            for file in os.listdir(path):
+                if file.endswith(".txt"):
+                    weapons.append(file.replace(".txt", ""))
+
+        # Если пусто, вернуть значения по умолчанию
+        if not weapons:
+            weapons = ["jitter", "R301", "flatline"]
+
+        return sorted(weapons)
+
+    def on_rcs_enabled_toggle(self):
+        config.rcs_enabled = bool(self.rcs_enabled_var.get())
+        if config.rcs_enabled:
+            from main import start_rcs
+            start_rcs()
+        else:
+            from main import stop_rcs
+            stop_rcs()
+        try:
+            if hasattr(config, "save") and callable(config.save):
+                config.save()
+        except Exception as e:
+            print(f"[WARN] Failed to save rcs_enabled: {e}")
+
+    def on_jitter_enabled_toggle(self):
+        config.jitter_enabled = bool(self.makcu_jitter_enabled_var.get())
+        try:
+            if hasattr(config, "save") and callable(config.save):
+                config.save()
+        except Exception as e:
+            print(f"[WARN] Failed to save jitter_enabled: {e}")
+
+    def on_rcs_game_change(self, value):
+        """При смене игры обновить список оружия"""
+        config.rcs_game = value
+
+        # Обновить список оружия для новой игры
+        weapons = self.get_rcs_weapons(value)
+
+        # Найти и обновить weapon меню
+        for widget in self.right_column.winfo_children():
+            for child in widget.winfo_children():
+                if isinstance(child, ctk.CTkFrame):
+                    for grandchild in child.winfo_children():
+                        if isinstance(grandchild, ctk.CTkOptionMenu):
+                            if grandchild.cget('variable') == self.rcs_weapon_var:
+                                grandchild.configure(values=weapons)
+                                if weapons:
+                                    self.rcs_weapon_var.set(weapons[0])
+                                break
+
+        try:
+            if hasattr(config, "save") and callable(config.save):
+                config.save()
+        except Exception as e:
+            print(f"[WARN] Failed to save rcs_game: {e}")
+
+    def on_rcs_weapon_change(self, value):
+        config.rcs_weapon = value
+        try:
+            if hasattr(config, "save") and callable(config.save):
+                config.save()
+        except Exception as e:
+            print(f"[WARN] Failed to save rcs_weapon: {e}")
+
+    def on_rcs_intensity_change(self, val):
+        """Обновление метки Intensity при движении слайдера"""
+        config.rcs_intensity = round(float(val), 2)
+        self.rcs_intensity_label.configure(text=f"{config.rcs_intensity:.2f}")
+        try:
+            if hasattr(config, "save") and callable(config.save):
+                config.save()
+        except Exception as e:
+            print(f"[WARN] Failed to save rcs_intensity: {e}")
+
+    def on_jitter_toggle(self):
+        config.jitter_enabled = self.makcu_jitter_enabled_var.get()
+        if jitter_controller:
+            if config.jitter_enabled:
+                jitter_controller.update_params()
+                jitter_controller.start()
+            else:
+                jitter_controller.stop()
+        config.save()
+
+    def update_jitter_interval(self, val):
+        config.jitter_interval = round(float(val), 4)
+        self.jitter_interval_label.configure(text=f"{config.jitter_interval:.4f}")
+        if jitter_controller:
+            jitter_controller.update_params()
+        config.save()
+
+    def update_hipfire_sens(self, val):
+        config.hipfire_sens = round(float(val), 2)
+        self.hipfire_label.configure(text=f"{config.hipfire_sens:.2f}")
+        if jitter_controller:
+            jitter_controller.update_params()
+        config.save()
+
+    def update_ads_sens(self, val):
+        config.ads_sens = round(float(val), 2)
+        self.ads_label.configure(text=f"{config.ads_sens:.2f}")
+        if jitter_controller:
+            jitter_controller.update_params()
+        config.save()
+
+    def update_fine_tune(self, val):
+        config.fine_tune_offset = int(round(float(val)))
+        self.fine_tune_label.configure(text=str(config.fine_tune_offset))
+        if jitter_controller:
+            jitter_controller.update_params()
+        config.save()
 
 
 if __name__ == "__main__":
