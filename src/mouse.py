@@ -20,6 +20,38 @@ SUPPORTED_DEVICES = [
 BAUD_RATES = [4_000_000, 2_000_000, 115_200]
 BAUD_CHANGE_COMMAND = bytearray([0xDE, 0xAD, 0x05, 0x00, 0xA5, 0x00, 0x09, 0x3D, 0x00])
 
+# Глобальное состояние блокировки движений
+movement_lock_state = {
+    "lock": threading.Lock(),
+    "lock_x": False,           # Текущая блокировка оси X
+    "lock_y": False,           # Текущая блокировка оси Y
+    "aimbot_locked": False,    # Флаг: аимбот активен
+    "last_move_time": 0,       # Время последнего движения
+    "timeout": 0.1             # Таймаут авто-разблокировки (100 мс)
+}
+
+def tick_movement_lock_manager():
+    """Менеджер блокировки осей — вызывается в каждом тике"""
+    try:
+        lock_acquired = movement_lock_state["lock"].acquire(timeout=0.01)
+        if not lock_acquired:
+            return
+            
+        try:
+            current_time = time.time()
+            
+            # Авто-разблокировка по таймауту
+            if movement_lock_state["aimbot_locked"]:
+                if current_time - movement_lock_state["last_move_time"] > movement_lock_state["timeout"]:
+                    movement_lock_state["aimbot_locked"] = False
+                    movement_lock_state["lock_x"] = False
+                    movement_lock_state["lock_y"] = False
+                    
+        finally:
+            movement_lock_state["lock"].release()
+    except Exception as e:
+        print(f"[MouseLock] Error: {e}")
+
 def find_com_ports():
     found = []
     for port in list_ports.comports():
