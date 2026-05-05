@@ -62,14 +62,14 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
         self._updating_conf = False
         self._updating_imgsz = False
         self.always_on_var = ctk.BooleanVar(value=bool(getattr(config, "always_on_aim", False)))
-        self.trigger_enabled_var   = ctk.BooleanVar(value=bool(getattr(config, "trigger_enabled", False)))
+        self.trigger_enabled_var = ctk.BooleanVar(value=bool(getattr(config, "trigger_enabled", False)))
         self.trigger_always_on_var = ctk.BooleanVar(value=bool(getattr(config, "trigger_always_on", False)))
-        self.trigger_btn_var       = ctk.IntVar(value=int(getattr(config, "trigger_button", 0)))
+        self.trigger_btn_var = ctk.IntVar(value=int(getattr(config, "trigger_button", 0)))
 
         # === Mouse Lock Variables ===
         self.mouse_lock_enabled_var = ctk.BooleanVar(value=bool(getattr(config, "mouse_lock_enabled", False)))
         self.mouse_lock_x_var = ctk.BooleanVar(value=bool(getattr(config, "mouse_lock_x", False)))
-        self.mouse_lock_y_var = ctk.BooleanVar(value=bool(getattr(config, "mouse_lock_y", True)))  # Y по умолчанию True
+        self.mouse_lock_y_var = ctk.BooleanVar(value=bool(getattr(config, "mouse_lock_y", True)))
         self.mouse_lock_timeout_var = ctk.DoubleVar(value=float(getattr(config, "mouse_lock_timeout", 0.1)))
 
         # Build UI and initialize
