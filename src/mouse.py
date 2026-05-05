@@ -30,27 +30,91 @@ movement_lock_state = {
     "timeout": 0.1             # Таймаут авто-разблокировки (100 мс)
 }
 
-def tick_movement_lock_manager():
-    """Менеджер блокировки осей — вызывается в каждом тике"""
+def tick_movement_lock_manager(timeout_override: float = None):
+    """
+    Менеджер блокировки осей — вызывается в каждом тике основного цикла.
+    
+    :param timeout_override: Переопределение таймаута (для тестов)
+    """
     try:
+        # Неблокирующий захват мьютекса (10 мс)
         lock_acquired = movement_lock_state["lock"].acquire(timeout=0.01)
         if not lock_acquired:
-            return
+            return  # Не удалось захватить — пропустим этот тик
             
         try:
             current_time = time.time()
+            timeout = timeout_override if timeout_override is not None else movement_lock_state["timeout"]
             
-            # Авто-разблокировка по таймауту
+            # Авто-разблокировка по таймауту бездействия
             if movement_lock_state["aimbot_locked"]:
-                if current_time - movement_lock_state["last_move_time"] > movement_lock_state["timeout"]:
+                idle_time = current_time - movement_lock_state["last_move_time"]
+                if idle_time > timeout:
+                    # Сбрасываем состояние блокировки
                     movement_lock_state["aimbot_locked"] = False
                     movement_lock_state["lock_x"] = False
                     movement_lock_state["lock_y"] = False
+                    # Опционально: лог для отладки
+                    # print(f"[MouseLock] Auto-unlocked after {idle_time*1000:.0f}ms idle")
                     
         finally:
             movement_lock_state["lock"].release()
+            
     except Exception as e:
-        print(f"[MouseLock] Error: {e}")
+        # Не даём ошибке прервать основной цикл
+        print(f"[MouseLock] Error in tick: {e}")
+
+# ====================================================================
+# Mouse Lock API — публичные функции для управления блокировками
+# ====================================================================
+
+def enable_aimbot_lock(lock_x: bool = False, lock_y: bool = False):
+    """
+    Активировать блокировку для аимбота.
+    
+    :param lock_x: Блокировать ось X
+    :param lock_y: Блокировать ось Y
+    """
+    try:
+        if movement_lock_state["lock"].acquire(timeout=0.01):
+            try:
+                movement_lock_state["aimbot_locked"] = True
+                movement_lock_state["lock_x"] = lock_x
+                movement_lock_state["lock_y"] = lock_y
+                movement_lock_state["last_move_time"] = time.time()
+            finally:
+                movement_lock_state["lock"].release()
+    except Exception as e:
+        print(f"[MouseLock] enable_aimbot_lock error: {e}")
+
+def disable_aimbot_lock():
+    """Мгновенно отключить блокировку аимбота"""
+    try:
+        if movement_lock_state["lock"].acquire(timeout=0.01):
+            try:
+                movement_lock_state["aimbot_locked"] = False
+                movement_lock_state["lock_x"] = False
+                movement_lock_state["lock_y"] = False
+            finally:
+                movement_lock_state["lock"].release()
+    except Exception as e:
+        print(f"[MouseLock] disable_aimbot_lock error: {e}")
+
+def set_lock_timeout(seconds: float):
+    """Установить таймаут авто-разблокировки (в секундах)"""
+    with movement_lock_state["lock"]:
+        movement_lock_state["timeout"] = max(0.01, min(2.0, seconds))  # clamp 10ms–2s
+
+def get_lock_state() -> dict:
+    """Получить текущее состояние блокировок (для GUI/отладки)"""
+    with movement_lock_state["lock"]:
+        return {
+            "aimbot_locked": movement_lock_state["aimbot_locked"],
+            "lock_x": movement_lock_state["lock_x"],
+            "lock_y": movement_lock_state["lock_y"],
+            "last_move_time": movement_lock_state["last_move_time"],
+            "timeout": movement_lock_state["timeout"],
+        }
 
 def find_com_ports():
     found = []
@@ -351,12 +415,33 @@ class Mouse:
             self._inited = True
 
     def move(self, x: float, y: float):
+        """Отправка движения с учётом блокировок осей (Mouse Lock)"""
         if not is_connected:
             return
+            
+        # Применяем блокировки осей из movement_lock_state
+        if movement_lock_state["aimbot_locked"]:
+            if movement_lock_state["lock_x"]:
+                x = 0
+            if movement_lock_state["lock_y"]:
+                y = 0
+                
+        # Если оба значения нулевые — нет смысла отправлять команду
+        if x == 0 and y == 0:
+            # Но всё равно обновим last_move_time, чтобы таймаут не сработал ложно
+            with movement_lock_state["lock"]:
+                movement_lock_state["last_move_time"] = time.time()
+            return
+            
         dx, dy = int(x), int(y)
+        
         with makcu_lock:
             makcu.write(f"km.move({dx},{dy})\r".encode())
             makcu.flush()
+            
+        # Обновляем время последнего движения для авто-разблокировки
+        with movement_lock_state["lock"]:
+            movement_lock_state["last_move_time"] = time.time()
 
     def move_bezier(self, x: float, y: float, segments: int, ctrl_x: float, ctrl_y: float):
         if not is_connected:
