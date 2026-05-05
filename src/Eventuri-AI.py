@@ -80,6 +80,12 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
         # Bind resize event
         self.bind("<Configure>", self.on_window_resize)
 
+        # === Mouse Lock Variables ===
+        self.mouse_lock_enabled_var = ctk.BooleanVar(value=bool(getattr(config, "mouse_lock_enabled", False)))
+        self.mouse_lock_x_var = ctk.BooleanVar(value=bool(getattr(config, "mouse_lock_x", False)))
+        self.mouse_lock_y_var = ctk.BooleanVar(value=bool(getattr(config, "mouse_lock_y", True)))  # Y по умолчанию True
+        self.mouse_lock_timeout_var = ctk.DoubleVar(value=float(getattr(config, "mouse_lock_timeout", 0.1)))
+
     def build_responsive_ui(self):
         """Build the responsive UI with proper scaling"""
         
@@ -208,6 +214,7 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
         # Detection, Aim, Mode, Dynamic, etc. follow:
         self.build_detection_settings(self.left_column, row); row += 1
         self.build_aim_settings(self.left_column, row); row += 1
+        self.build_mouse_lock_section(self.left_column, row); row += 1
         self.build_aimbot_mode(self.left_column, row); row += 1
         self.dynamic_frame = ctk.CTkFrame(self.left_column, fg_color=BG)
         self.dynamic_frame.grid(row=row, column=0, sticky="ew", pady=(0, 10))
@@ -721,6 +728,49 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
         for i, txt in enumerate(["Left", "Right", "Middle", "Side 4", "Side 5"]):
             ctk.CTkRadioButton(btn_frame, text=txt, variable=self.btn_var, value=i, command=self.update_mouse_btn, text_color="#fff").pack(side="left", padx=8)
 
+    
+    def build_mouse_lock_section(self, parent, row):
+        """🔒 Mouse Lock settings section"""
+        frame = ctk.CTkFrame(parent, fg_color="#1a1a1a")
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        frame.grid_columnconfigure(1, weight=1)
+    
+        ctk.CTkLabel(frame, text="🔒 Mouse Lock", font=("Segoe UI", 16, "bold"), text_color="#00e676")\
+            .grid(row=0, column=0, columnspan=2, pady=(15, 10), padx=15, sticky="w")
+    
+        # Toggle
+        ctk.CTkSwitch(frame, text="Enable Mouse Lock", text_color="#fff",
+                      variable=self.mouse_lock_enabled_var,
+                      command=self.on_mouse_lock_toggle).grid(row=1, column=0, sticky="w", padx=15, pady=5)
+    
+        # Axis locks
+        axis_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        axis_frame.grid(row=2, column=0, columnspan=2, sticky="w", padx=30, pady=(0, 10))
+        
+        ctk.CTkCheckBox(axis_frame, text="Lock X-axis (horizontal)", text_color="#fff",
+                        variable=self.mouse_lock_x_var, command=self.on_mouse_lock_axis_change).pack(side="left", padx=(0, 20))
+        ctk.CTkCheckBox(axis_frame, text="Lock Y-axis (vertical)", text_color="#fff",
+                        variable=self.mouse_lock_y_var, command=self.on_mouse_lock_axis_change).pack(side="left")
+    
+        # Timeout slider
+        ctk.CTkLabel(frame, text="Unlock timeout (ms):", text_color="#fff").grid(row=3, column=0, sticky="w", padx=15)
+        
+        timeout_wrap = ctk.CTkFrame(frame, fg_color="transparent")
+        timeout_wrap.grid(row=3, column=1, sticky="ew", padx=(5, 15))
+        
+        self.mouse_lock_timeout_slider = ctk.CTkSlider(timeout_wrap, from_=0.05, to=0.5, number_of_steps=45,
+                                                       command=self.on_mouse_lock_timeout_change)
+        self.mouse_lock_timeout_slider.pack(side="left", fill="x", expand=True)
+        self.mouse_lock_timeout_label = ctk.CTkLabel(timeout_wrap, text=f"{int(config.mouse_lock_timeout*1000)} ms",
+                                                     text_color=NEON, width=40)
+        self.mouse_lock_timeout_label.pack(side="right", padx=(10, 0))
+        
+        self.mouse_lock_timeout_slider.set(config.mouse_lock_timeout)
+    
+        # Info label
+        ctk.CTkLabel(frame, text="💡 Locks mouse axes while aiming to prevent drift", 
+                     font=("Segoe UI", 10), text_color="#888").grid(row=4, column=0, columnspan=2, 
+                                                                   padx=15, pady=(0, 10), sticky="w")
 
     def build_aimbot_mode(self, parent, row):
         """Aimbot mode selection"""
@@ -981,6 +1031,15 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
             self.makcu_jitter_enabled_var.set(bool(getattr(config, "jitter_enabled", False)))
         except Exception:
             pass  # На случай, если виджеты ещё не созданы
+
+        # === Mouse Lock sync ===
+        self.mouse_lock_enabled_var.set(bool(getattr(config, "mouse_lock_enabled", False)))
+        self.mouse_lock_x_var.set(bool(getattr(config, "mouse_lock_x", False)))
+        self.mouse_lock_y_var.set(bool(getattr(config, "mouse_lock_y", True)))
+        self.mouse_lock_timeout_var.set(float(getattr(config, "mouse_lock_timeout", 0.1)))
+        if hasattr(self, 'mouse_lock_timeout_slider'):
+            self.mouse_lock_timeout_slider.set(config.mouse_lock_timeout)
+            self.mouse_lock_timeout_label.configure(text=f"{int(config.mouse_lock_timeout*1000)} ms")
 
 
     def on_capture_mode_change(self, value: str):
@@ -1759,6 +1818,36 @@ class EventuriGUI(ctk.CTk, GUISections, GUICallbacks):
         if jitter_controller:
             jitter_controller.update_params()
         config.save()
+
+    # === Mouse Lock Callbacks ===
+    def on_mouse_lock_toggle(self):
+        """Toggle Mouse Lock enabled/disabled"""
+        config.mouse_lock_enabled = bool(self.mouse_lock_enabled_var.get())
+        try:
+            if hasattr(config, "save") and callable(config.save):
+                config.save()
+        except Exception as e:
+            print(f"[WARN] Failed to save mouse_lock_enabled: {e}")
+    
+    def on_mouse_lock_axis_change(self):
+        """Handle axis lock changes"""
+        config.mouse_lock_x = bool(self.mouse_lock_x_var.get())
+        config.mouse_lock_y = bool(self.mouse_lock_y_var.get())
+        try:
+            if hasattr(config, "save") and callable(config.save):
+                config.save()
+        except Exception as e:
+            print(f"[WARN] Failed to save mouse_lock axis: {e}")
+    
+    def on_mouse_lock_timeout_change(self, val):
+        """Handle timeout slider change"""
+        config.mouse_lock_timeout = round(float(val), 3)
+        self.mouse_lock_timeout_label.configure(text=f"{int(float(val)*1000)} ms")
+        try:
+            if hasattr(config, "save") and callable(config.save):
+                config.save()
+        except Exception as e:
+            print(f"[WARN] Failed to save mouse_lock_timeout: {e}")
 
 
 if __name__ == "__main__":
