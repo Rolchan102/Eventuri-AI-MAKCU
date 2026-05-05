@@ -442,10 +442,17 @@ class Mouse:
         # Обновляем время последнего движения для авто-разблокировки
         with movement_lock_state["lock"]:
             movement_lock_state["last_move_time"] = time.time()
-
     def move_bezier(self, x: float, y: float, segments: int, ctrl_x: float, ctrl_y: float):
         if not is_connected:
             return
+            
+        # 🔒 Применяем блокировки осей (аналогично move())
+        if movement_lock_state["aimbot_locked"]:
+            if movement_lock_state["lock_x"]:
+                x = 0
+            if movement_lock_state["lock_y"]:
+                y = 0
+                
         with makcu_lock:
             cmd = f"km.move({int(x)},{int(y)},{int(segments)},{int(ctrl_x)},{int(ctrl_y)})\r"
             makcu.write(cmd.encode())
@@ -468,7 +475,17 @@ class Mouse:
     @staticmethod
     def cleanup():
         global is_connected, makcu, _mask_applied_idx
-        # Always release any locks before closing port
+        
+        # Сброс состояния Mouse Lock
+        try:
+            with movement_lock_state["lock"]:
+                movement_lock_state["aimbot_locked"] = False
+                movement_lock_state["lock_x"] = False
+                movement_lock_state["lock_y"] = False
+        except Exception:
+            pass
+
+        # Всегда снимаем блокировки кнопок перед закрытием порта
         try:
             unlock_all_locks()
         except Exception:
