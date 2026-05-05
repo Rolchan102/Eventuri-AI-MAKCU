@@ -166,7 +166,7 @@ class Config:
         # Настройки Mouse Lock
         self.mouse_lock_enabled: bool = False      # Включить систему блокировок
         self.mouse_lock_x: bool = False            # Блокировать ось X при аиме
-        self.mouse_lock_y: bool = False            # Блокировать ось Y при аиме
+        self.mouse_lock_y: bool = True             # Блокировать ось Y при аиме
         self.mouse_lock_timeout: float = 0.1       # Таймаут авто-разблокировки (сек)
 
     # -- Profile functions --
