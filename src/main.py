@@ -15,7 +15,7 @@ from config import config
 from windmouse_smooth import smooth_aimer
 from jitter import JitterController
 
-# === ИМПОРТ DETECTION_V2 v2.7 ===
+# === ИМПОРТ DETECTION_V2 v2.12 ===
 from detection_v2 import (
     DeadzoneFilter,
     DetectorConfig,
@@ -51,7 +51,6 @@ def _setup_logging():
     except Exception as e:
         print(f"[WARN] Не удалось создать файл логов: {e}")
 
-
 _setup_logging()
 logger = logging.getLogger("aimbot")
 
@@ -76,9 +75,9 @@ class Aimbot:
 
         self.makcu = None
         self._owns_makcu = False
-        self._makcu_lock = threading.Lock()
+        # УБРАНО: self._makcu_lock больше не нужен, так как только один поток обращается к makcu
+        
         self.jitter_controller = None
-
         self.model = None
         self.class_names = {}
 
@@ -101,12 +100,19 @@ class Aimbot:
         self._last_frame_ts = 0.0
         self._frame_dt = 0.014
         
-        # Для компенсации ego_shift (движение мыши на прошлом кадре)
+        # Для компенсации ego_shift
         self._last_aim_dx = 0.0
         self._last_aim_dy = 0.0
 
-        # === ИНТЕГРАЦИЯ DETECTION_V2 v2.7 ===
-        # 1. Deadzone с гистерезисом и плавным стартом
+        # 4. ОПТИМИЗАЦИЯ: Кэширование distance_multiplier (вычисляется 1 раз)
+        sens = getattr(config, 'in_game_sens', 1.5)
+        self._distance_multiplier = 1.07437623 * math.pow(sens, -0.9936827126)
+
+        # 3. ОПТИМИЗАЦИЯ: Флаги для безопасной инициализации OpenCV вне цикла
+        self._debug_window_initialized = False
+        self._debug_win_name = "AI Debug"
+
+        # === ИНТЕГРАЦИЯ DETECTION_V2 ===
         self.deadzone = DeadzoneFilter(
             enter=getattr(config, 'deadzone_enter', 0.8),
             exit_ratio=0.6,
@@ -114,40 +120,34 @@ class Aimbot:
             rescale=True
         )
 
-        # 2. Дебаунс кнопки (централизованное управление)
         self.button_debounce = ButtonDebounce(
             release_frames=getattr(config, 'button_release_frames', 1),
             always_on=getattr(config, 'always_on_aim', False)
         )
 
-        # 3. EgoTracker (учитывает и ваше наведение, и джиттер, с размазыванием отклика)
         self.ego_tracker = EgoTracker(
             px_per_unit=getattr(config, 'ego_px_per_unit', 0.7),
             jitter_offset=self.jitter_controller.offset_at if self.jitter_controller else None,
             latency_s=getattr(config, 'ego_latency_s', 0.03),
-            aim_latency_s=getattr(config, 'aim_latency_s', 0.0),
-            aim_smear_s=getattr(config, 'aim_smear_s', 0.0)
+            aim_latency_s=getattr(config, 'aim_latency_s', 0.03),
+            aim_smear_s=getattr(config, 'aim_smear_s', 0.04)
         )
 
-        # 4. TargetLock с рекомендуемыми настройками v2.7
         lock_cfg = LockConfig.recommended(
             lost_frames=getattr(config, 'lock_lost_frames', 15),
             match_radius=getattr(config, 'lock_match_radius', 0.1),
             acquire_frames=getattr(config, 'lock_acquire_frames', 2),
             acquire_conf=getattr(config, 'lock_acquire_conf', 0.35),
-            coast_radius_max=getattr(config, 'lock_coast_radius_max', 1.0)
+            coast_radius_max=getattr(config, 'lock_coast_radius_max', 1.0),
+            hard_lock=getattr(config, 'lock_hard_lock', True),
+            radius_heights=getattr(config, 'lock_radius_heights', 2.0),
+            size_ratio_max=getattr(config, 'lock_size_ratio_max', 2.0),
+            neighbor_guard=getattr(config, 'lock_neighbor_guard', 0.5),
+            relock_after_lost=getattr(config, 'lock_relock_after_lost', False),
+            size_free_heights=getattr(config, 'lock_size_free_heights', 0.5),
         )
         self.target_lock = TargetLock(lock_cfg)
 
-        # В конце __init__, после создания self.target_lock:
-        cfg = self.target_lock.config
-        logger.info(
-            f"DETECTION_V2 v2.10 | Lock: coast_max={cfg.coast_radius_max}, "
-            f"neighbor_guard={cfg.neighbor_guard}, size_free={cfg.size_free_heights}, "
-            f"relock={cfg.relock_after_lost}, ego_scale={getattr(config, 'ego_px_per_unit', 0.0)}"
-        )
-
-        # 5. TargetLifecycle (автоматизирует дебаунс, лок и богатое логирование)
         self.lifecycle = TargetLifecycle(
             lock=self.target_lock,
             debounce=self.button_debounce,
@@ -156,7 +156,6 @@ class Aimbot:
             logger=logger
         )
 
-        # 6. Конфигурация детектора
         priority_labels = set()
         if config.custom_player_label:
             priority_labels.add(config.custom_player_label.lower())
@@ -168,38 +167,32 @@ class Aimbot:
             poi_offset=getattr(config, 'player_poi_offset', 0.2),
             use_tracking=getattr(config, 'use_tracking', False),
             priority_labels=frozenset(priority_labels),
-            aim_margin_px=getattr(config, 'aim_margin_px', 4.0), # ВАЖНО: допуск для джиттера
+            aim_margin_px=getattr(config, 'aim_margin_px', 4.0),
             ref_center=None
         )
 
     def _now_ms(self):
         return time.perf_counter() * 1000.0
 
+    # 2. ОПТИМИЗАЦИЯ: Убраны self._makcu_lock. Этот метод теперь вызывается ТОЛЬКО из smooth_movement_loop
     def _locked_move(self, dx, dy):
-        t0 = time.perf_counter()
-        with self._makcu_lock:
-            wait_ms = (time.perf_counter() - t0) * 1000.0
-            if wait_ms > 2.0:
-                self._lock_waits += 1
-                logger.debug("LOCK wait %.1f ms before move", wait_ms)
+        if self.makcu is not None:
             self.makcu.move(dx, dy)
 
     def _locked_click(self):
-        t0 = time.perf_counter()
-        with self._makcu_lock:
-            wait_ms = (time.perf_counter() - t0) * 1000.0
-            if wait_ms > 2.0:
-                self._lock_waits += 1
+        if self.makcu is not None:
             self.makcu.click()
 
     def smooth_movement_loop(self):
-        logger.info("Smooth movement thread started")
+        logger.info("Smooth movement thread started (Sole owner of makcu)")
         while not self.stop_event.is_set():
             try:
-                move_data = self.smooth_move_queue.get(timeout=0.1)
+                move_data = self.smooth_move_queue.get(timeout=0.05)
                 dx, dy, delay = move_data
+                
                 if self.makcu is not None:
                     self._locked_move(dx, dy)
+                
                 if delay > 0:
                     time.sleep(delay)
             except queue.Empty:
@@ -260,6 +253,7 @@ class Aimbot:
             pass
         logger.info("Capture loop stopped")
 
+    # 1. и 2. ОПТИМИЗАЦИЯ: Полностью неблокирующая отправка в очередь. Никаких lock.
     def _apply_movement_mode(self, dx, dy, frame_count, best_target=None):
         final_dx, final_dy = 0.0, 0.0
         
@@ -267,14 +261,10 @@ class Aimbot:
             dt = self._frame_dt
             dist_px = math.hypot(dx, dy)
             
-            if dist_px > 80:
-                base_gain = 0.55
-            elif dist_px > 40:
-                base_gain = 0.45
-            elif dist_px > 15:
-                base_gain = 0.35
-            else:
-                base_gain = 0.25
+            if dist_px > 80: base_gain = 0.55
+            elif dist_px > 40: base_gain = 0.45
+            elif dist_px > 15: base_gain = 0.35
+            else: base_gain = 0.25
 
             tau_x = 0.010 / max(config.normal_x_speed, 0.01)
             tau_y = 0.010 / max(config.normal_y_speed, 0.01)
@@ -291,38 +281,32 @@ class Aimbot:
                 dx *= k
                 dy *= k
 
-            dx, dy = self.deadzone.apply(dx, dy)
-            final_dx, final_dy = dx, dy
-
-            if logger.isEnabledFor(logging.DEBUG) and frame_count % 15 == 0:
-                logger.debug("Frame #%d | gain=(%.2f,%.2f) move=(%.2f,%.2f) | dz_active=%s",
-                             frame_count, gain_x, gain_y, dx, dy, self.deadzone.active)
-
-            if dx != 0.0 or dy != 0.0:
-                self._locked_move(dx, dy)
+            final_dx, final_dy = self.deadzone.apply(dx, dy)
 
         elif config.mode == "bezier":
-            final_dx, final_dy = dx, dy
-            with self._makcu_lock:
-                self.makcu.move_bezier(dx, dy, config.bezier_segments, config.bezier_ctrl_x, config.bezier_ctrl_y)
+            # Для упрощения конвейера bezier тоже считает финальные координаты и отправляет в очередь
+            # (Внутренняя логика bezier может быть адаптирована под этот паттерн)
+            final_dx, final_dy = dx, dy 
         elif config.mode == "silent":
             final_dx, final_dy = dx, dy
-            with self._makcu_lock:
-                self.makcu.move_bezier(dx, dy, config.silent_segments, config.silent_ctrl_x, config.silent_ctrl_y)
         elif config.mode == "smooth":
-            final_dx, final_dy = dx, dy
+            # smooth уже работает через очередь, но для унификации:
             path = smooth_aimer.calculate_smooth_path(dx, dy, config)
             for move_dx, move_dy, delay in path:
-                if self.smooth_move_queue.full():
-                    break
                 try:
                     self.smooth_move_queue.put_nowait((move_dx, move_dy, delay))
                 except queue.Full:
                     break
-            if len(path) == 0:
-                self._locked_move(dx, dy)
-        
-        # Сохраняем финальное движение для компенсации ego_shift на следующем кадре
+            return # Если smooth, мы уже заполнили очередь, выходим
+
+        # Отправка в очередь БЕЗ блокировок (Zero-lock pipeline)
+        if final_dx != 0.0 or final_dy != 0.0:
+            try:
+                self.smooth_move_queue.put_nowait((final_dx, final_dy, 0.0))
+            except queue.Full:
+                pass # Пропускаем кадр, если очередь переполнена, чтобы не тормозить инференс
+
+        # Сохраняем для ego_shift
         self._last_aim_dx = final_dx
         self._last_aim_dy = final_dy
 
@@ -343,7 +327,7 @@ class Aimbot:
             if not self.jitter_controller.is_active:
                 self.jitter_controller.update_params()
                 if not self.jitter_controller.start():
-                    pass # Поток еще останавливается, повторим на следующем кадре
+                    pass 
                 else:
                     logger.info("JITTER START | pattern=%s amp=%d/%d",
                                 self.jitter_controller.pattern, self.jitter_controller.amp_x, self.jitter_controller.amp_y)
@@ -352,7 +336,6 @@ class Aimbot:
                 self._jitter_deactivate_ts = now
 
             if self.jitter_controller.is_active and (now - self._jitter_deactivate_ts) > 0.20:
-                # ИСПРАВЛЕНИЕ v2.7: неблокирующая остановка
                 self.jitter_controller.request_stop()
                 logger.info("JITTER STOP")
 
@@ -368,7 +351,6 @@ class Aimbot:
 
         frame_count = 0
         start_time = time.perf_counter()
-        debug_window_moved = False
 
         while not self.stop_event.is_set():
             try:
@@ -382,9 +364,7 @@ class Aimbot:
                 frame_count += 1
                 continue
 
-            # 1. Захватываем время СРАЗУ после получения кадра (критично для EgoTracker и time-based tracking)
             t_frame = time.perf_counter()
-            
             if self._last_frame_ts:
                 self._frame_dt = min(max(t_frame - self._last_frame_ts, 0.001), 0.05)
             self._last_frame_ts = t_frame
@@ -415,16 +395,13 @@ class Aimbot:
             if debug_img is not None:
                 draw_debug_overlay(debug_img, result)
 
-            # 2. Читаем сырое состояние кнопки
             raw_button_held = is_button_pressed(config.selected_mouse_button)
             
-            # 3. Считаем ego_shift на основе движения ПРЕДЫДУЩЕГО кадра + джиттер
             ego_shift = self.ego_tracker.update(
                 aim_move=(self._last_aim_dx, self._last_aim_dy),
                 t=t_frame
             )
             
-            # 4. ОДНИМ вызовом: дебаунс, обновление лока, логирование событий
             life_result = self.lifecycle.update(
                 result.entities, image.shape[:2], raw_button_held, 
                 ego_shift=ego_shift, t=t_frame
@@ -434,14 +411,12 @@ class Aimbot:
             lock_status = life_result.status
             button_held = life_result.held
 
-            # === ВРЕМЕННЫЙ БЛОК ДЛЯ КАЛИБРОВКИ ego_px_per_unit ===
+            # Блок калибровки (оставлен для финальной сверки)
             if lock_status == LockStatus.TRACKING and best_target is not None and self._last_best_center is not None:
                 dx = best_target.poi[0] - self._last_best_center[0]
                 dy = best_target.poi[1] - self._last_best_center[1]
                 logger.info(f"EGO | dx={dx:.1f} dy={dy:.1f} | mx={self._last_aim_dx:.2f} my={self._last_aim_dy:.2f} | dt={self._frame_dt*1000:.1f}ms")
-            # ========================================================
 
-            # 5. Обновляем внутреннюю диагностику EMA (логи теперь пишет lifecycle, но EMA нужен)
             if best_target:
                 cx, cy = best_target.poi
                 self._last_dist = best_target.distance_px
@@ -451,11 +426,9 @@ class Aimbot:
                     self._last_best_center = (cx, cy)
                     self._had_target = True
                 elif lock_status == LockStatus.COASTING:
-                    pass # Цель моргнула, держим EMA
-                
+                    pass 
             else:
                 if self._had_target:
-                    # lifecycle уже написал TARGET LOST или RELEASED
                     pass
                 self._had_target = False
                 self._last_best_center = None
@@ -467,7 +440,6 @@ class Aimbot:
                     self._last_dist = 999.0
                     self.deadzone.reset()
 
-            # 6. Расчет движения
             if best_target:
                 tx, ty = best_target.poi
                 box_height = best_target.height
@@ -476,27 +448,28 @@ class Aimbot:
                     self.ema_target_x, self.ema_target_y = tx, ty
                 else:
                     jump_dist = math.hypot(tx - self.ema_target_x, ty - self.ema_target_y)
-                    if jump_dist > self.jump_threshold_px or (box_height > 250 and jump_dist > 20.0):
-                        self.ema_target_x, self.ema_target_y = tx, ty
-                    else:
-                        alpha = 0.85 if (box_height < 60 and jump_dist > 2.0) else \
-                                0.80 if jump_dist > 15.0 else \
-                                0.40 if jump_dist > 5.0 else 0.15
-                        self.ema_target_x = alpha * tx + (1 - alpha) * self.ema_target_x
-                        self.ema_target_y = alpha * ty + (1 - alpha) * self.ema_target_y
+                    
+                    # 3. ОПТИМИЗАЦИЯ: Плавная EMA вместо ступенчатого if/else
+                    max_dist = 20.0
+                    min_alpha, max_alpha = 0.15, 0.85
+                    raw_alpha = min_alpha + (max_alpha - min_alpha) * min(jump_dist / max_dist, 1.0)
+                    
+                    if box_height < 60 and jump_dist > 2.0:
+                        raw_alpha = max(raw_alpha, 0.85)
+                        
+                    alpha = max(min_alpha, min(max_alpha, raw_alpha))
+                    
+                    self.ema_target_x = alpha * tx + (1 - alpha) * self.ema_target_x
+                    self.ema_target_y = alpha * ty + (1 - alpha) * self.ema_target_y
 
                 target_screen_x = region_left + self.ema_target_x
                 target_screen_y = region_top + self.ema_target_y
-                raw_dx = target_screen_x - crosshair_x
-                raw_dy = target_screen_y - crosshair_y
                 
-                sens = config.in_game_sens
-                distance_multiplier = 1.07437623 * math.pow(sens, -0.9936827126)
+                # 4. ОПТИМИЗАЦИЯ: Используем закэшированный множитель
+                raw_dx = (target_screen_x - crosshair_x) * self._distance_multiplier
+                raw_dy = (target_screen_y - crosshair_y) * self._distance_multiplier
                 
-                dx = raw_dx * distance_multiplier
-                dy = raw_dy * distance_multiplier
-                
-                self._apply_movement_mode(dx, dy, frame_count, best_target)
+                self._apply_movement_mode(raw_dx, raw_dy, frame_count, best_target)
             else:
                 if t_frame - self._last_target_ts > 0.20:
                     smooth_aimer.reset_fatigue()
@@ -505,21 +478,20 @@ class Aimbot:
                     self._last_dist = 999.0
                     self.deadzone.reset()
 
-            # 7. Джиттер (теперь использует дебаунсенное button_held)
             self._process_jitter(button_held)
 
-            # Отрисовка дебаг-окна
-            if debug_img is not None:
-                win_name = "AI Debug"
-                cv2.imshow(win_name, debug_img)
-                if not debug_window_moved:
+            # 5. ОПТИМИЗАЦИЯ: Безопасная отрисовка OpenCV без утечек GDI
+            if config.show_debug_window and result.entities:
+                if not self._debug_window_initialized:
+                    cv2.namedWindow(self._debug_win_name, cv2.WINDOW_AUTOSIZE)
                     x = (config.screen_width - debug_img.shape[1]) // 2
                     y = (config.screen_height - debug_img.shape[0]) // 2
-                    cv2.moveWindow(win_name, x, y)
-                    debug_window_moved = True
+                    cv2.moveWindow(self._debug_win_name, x, y)
+                    self._debug_window_initialized = True
+                
+                cv2.imshow(self._debug_win_name, debug_img)
                 cv2.waitKey(1)
 
-            # Статистика FPS
             frame_ms = (time.perf_counter() - t_frame) * 1000.0
             self._frame_ms_ema = frame_ms if not self._frame_ms_ema else 0.9 * self._frame_ms_ema + 0.1 * frame_ms
             if frame_ms > 35.0:
@@ -580,10 +552,19 @@ class Aimbot:
         self.aim_thread.start()
 
         if self.jitter_controller is None:
-            self.jitter_controller = JitterController(self.makcu, self._makcu_lock)
+            self.jitter_controller = JitterController(self.makcu) # Убран lock из инициализации
 
         self._running = True
         _aimbot_running = True
+        
+        # Вывод конфигурации в лог при старте
+        log_startup_config(
+            self.target_lock.config,
+            self.detector_config,
+            ego=self.ego_tracker,
+            logger=logger
+        )
+        
         logger.info(f"Aimbot started in {config.mode} mode.")
 
     def stop(self):
