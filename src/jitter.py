@@ -1,5 +1,6 @@
 import bisect
 import math
+import queue
 import sys
 import threading
 import time
@@ -22,8 +23,7 @@ MIN_SPEED_MS = 1          # speed_ms <= 0 превратил бы цикл в ho
 STOP_JOIN_TIMEOUT = 0.5   # сколько stop()/start() ждут завершения потока
 ROLLBACK_TIMEOUT = 0.3    # сколько откат ждёт lock устройства
 LOCK_POLL = 0.05          # шаг опроса lock, чтобы вовремя замечать stop
-START_JOIN_TIMEOUT = 0.05  # сколько start() ждёт ещё не вышедший поток (вызывается из цикла кадров:
-#                            ждать долго нельзя; не успел - вернёт False, повторите на следующем кадре)
+START_JOIN_TIMEOUT = 0.05 # сколько start() ждёт ещё не вышедший поток
 OFFSET_HISTORY = 1024     # записей (время, смещение) для offset_at(): ~3 с при шаге 3 мс
 
 # Неизменяемый снимок параметров: update_params подменяет его одним присваиванием
@@ -58,10 +58,7 @@ def _from_config(key, default, check):
         return default
 
 
-# Python 3.11+ на Windows сам спит по высокоточному таймеру (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION):
-# time.sleep(0.003) держит ~3 мс без timeBeginPeriod. Этот таймер не зависит от того, свёрнуто ли
-# окно (Windows 11 игнорирует timeBeginPeriod у невидимых процессов) и не меняет системный тик.
-# На 3.10 и старше остаётся timeBeginPeriod(1). Переопределить: JITTER_FORCE_TIMER_PERIOD = True.
+# Python 3.11+ на Windows сам спит по высокоточному таймеру
 HIGH_RES_SLEEP = sys.version_info >= (3, 11)
 JITTER_FORCE_TIMER_PERIOD = False
 
@@ -70,10 +67,8 @@ if sys.platform == 'win32':
     _winmm = ctypes.WinDLL('winmm')
 
     def _timer_begin():
-        # Без этого шаг sleep на Windows (Python < 3.11) ~15 мс, а не 1 мс.
-        # Флаг процессный, а не потоковый: влияет на энергопотребление всего приложения.
         try:
-            return _winmm.timeBeginPeriod(1) == 0  # 0 == TIMERR_NOERROR
+            return _winmm.timeBeginPeriod(1) == 0
         except Exception:
             return False
 
@@ -88,22 +83,29 @@ else:
 
 
 class JitterController:
-    def __init__(self, makcu_instance, makcu_lock=None):
+    def __init__(self, makcu_instance, makcu_lock=None, move_queue=None):
+        """
+        makcu_instance - устройство мыши (MAKCU)
+        makcu_lock     - общий lock для синхронизации с другими потоками (опционально)
+        move_queue     - очередь для Zero-Lock Pipeline. Если передана, _move() пушит
+                         в неё вместо прямого вызова makcu.move(). Это делает джиттер
+                         частью общего конвейера с smooth_movement_loop.
+        """
         self.makcu = makcu_instance
         self.lock = makcu_lock or threading.Lock()
+        self.move_queue = move_queue  # Если не None, используем Zero-Lock Pipeline
         self._thread = None
         self._stop = threading.Event()
         self._lifecycle_lock = threading.Lock()
         self._params_write_lock = threading.Lock()
         self._warned_pattern = None
-        # Накопленное смещение, которое джиттер РЕАЛЬНО отправил в устройство (единицы мыши).
-        # Пишет только поток джиттера (шаги и откат), читают любые потоки: присваивание кортежа атомарно.
+        # Накопленное смещение, которое джиттер РЕАЛЬНО отправил (единицы мыши).
+        # Пишет только поток джиттера (шаги и откат), читают любые потоки.
         self._offset = (0.0, 0.0)
         self._hist = deque([(time.perf_counter(), 0.0, 0.0)], maxlen=OFFSET_HISTORY)
-        # Дробная часть шага, не отправленная в устройство (переносится на следующий шаг):
-        # в устройство уходят только целые единицы, поэтому откат и offset точные
+        # Дробная часть шага, не отправленная в устройство
         self._carry = (0.0, 0.0)
-        self._cfg_seen = None          # значения config при последнем чтении (см. start())
+        self._cfg_seen = None
         self.update_params()
 
     @property
@@ -112,22 +114,17 @@ class JitterController:
 
     @is_active.setter
     def is_active(self, value):
-        # legacy: jitter.is_active = True/False. False теперь НЕ блокирует (request_stop);
-        # True вызывает start() (ждёт не дольше START_JOIN_TIMEOUT)
         self.start() if value else self.request_stop()
 
     @property
     def offset(self):
-        """(x, y): сколько единиц мыши джиттер сдвинул в сумме с момента создания объекта
-        (шаги и откаты). Это КОМАНДА, отправленная в устройство; если оно округляет дробные
-        шаги, фактическое смещение может отличаться."""
+        """(x, y): сколько единиц мыши джиттер сдвинул в сумме."""
         return self._offset
 
     def offset_at(self, t):
-        """Смещение (x, y) на момент t (time.perf_counter()), например на момент съёмки кадра
-        минус задержка захвата. Для t раньше самой старой записи - самая старая запись."""
-        hist = self._hist.copy()      # снимок одной C-операцией: поток джиттера может дописывать
-        i = bisect.bisect_right(hist, t, key=lambda r: r[0])   # после последней записи с меткой <= t
+        """Смещение (x, y) на момент t (time.perf_counter())."""
+        hist = self._hist.copy()
+        i = bisect.bisect_right(hist, t, key=lambda r: r[0])
         _, x, y = hist[max(i - 1, 0)]
         return x, y
 
@@ -137,9 +134,6 @@ class JitterController:
         self._offset = (ox, oy)
         self._hist.append((t, ox, oy))
 
-    # Параметры раньше были обычными атрибутами, которые меняли на лету;
-    # цикл подхватывает изменение со следующего цикла паттерна.
-    # Сеттеры можно вызывать из любых потоков (запись под _params_write_lock).
     def _set_param(self, **kw):
         with self._params_write_lock:
             self._params = self._params._replace(**kw)
@@ -186,16 +180,14 @@ class JitterController:
         )
 
     def update_params(self):
-        """Полностью перечитать параметры из config (значения из сеттеров заменяются)."""
+        """Полностью перечитать параметры из config."""
         params = self._read_config()
         with self._params_write_lock:
             self._params = params
             self._cfg_seen = params
 
     def _refresh_from_config(self):
-        """Взять из config только то, что ИЗМЕНИЛОСЬ в нём с прошлого чтения. Значения,
-        заданные сеттерами (j.amp_x = ...), сохраняются, пока соответствующий ключ config
-        не поменяют."""
+        """Взять из config только то, что ИЗМЕНИЛОСЬ с прошлого чтения."""
         cfg = self._read_config()
         with self._params_write_lock:
             seen = self._cfg_seen
@@ -218,8 +210,20 @@ class JitterController:
         return steps
 
     def _move(self, dx, dy, stop=None, timeout=None):
-        """True, если движение выполнено. False, если не дождались lock:
-        из-за stop или по timeout. Тогда смещение НЕ произошло."""
+        """Отправка движения. Если есть move_queue — пушим в неё (Zero-Lock).
+        Иначе — прямой вызов через lock (fallback для обратной совместимости)."""
+        q = self.move_queue
+        if q is not None:
+            try:
+                t0 = time.perf_counter()
+                q.put_nowait((dx, dy, 0.0))
+                # Записываем в историю только после успешной отправки в очередь
+                self._record(dx, dy, 0.5 * (t0 + time.perf_counter()))
+                return True
+            except queue.Full:
+                return False
+
+        # Fallback: прямой вызов через lock
         deadline = None if timeout is None else time.monotonic() + timeout
         while not self.lock.acquire(timeout=LOCK_POLL):
             if stop is not None and stop.is_set():
@@ -228,8 +232,8 @@ class JitterController:
                 return False
         try:
             t0 = time.perf_counter()
-            self.makcu.move(dx, dy)
-            # только после успешной отправки; время - середина вызова (точнее для latency_s)
+            if self.makcu:
+                self.makcu.move(dx, dy)
             self._record(dx, dy, 0.5 * (t0 + time.perf_counter()))
         finally:
             self.lock.release()
@@ -237,8 +241,8 @@ class JitterController:
 
     def _rollback(self, ox, oy):
         if not (ox or oy):
-            return                    # цикл завершён целиком: остаток переносится в следующий
-        self._carry = (0.0, 0.0)      # прерванный цикл: откатываем и начинаем с чистого остатка
+            return
+        self._carry = (0.0, 0.0)
         try:
             if not self._move(-ox, -oy, timeout=ROLLBACK_TIMEOUT):
                 log.warning("jitter: rollback skipped, device lock is busy (offset %r, %r)", ox, oy)
@@ -260,23 +264,21 @@ class JitterController:
                     continue
                 p = self._params
                 delay = p.speed_ms / 1000.0
-                ox = oy = 0  # смещение внутри текущего цикла паттерна
+                ox = oy = 0
                 failed = False
                 try:
                     for sx, sy in self._resolve_steps(p.pattern):
                         if stop.is_set():
                             break
-                        # дробные амплитуды: шлём целое, остаток переносим на следующий шаг
                         cx, cy = self._carry
                         wx, wy = sx * p.amp_x + cx, sy * p.amp_y + cy
                         dx, dy = _round_half_away(wx), _round_half_away(wy)
                         if dx or dy:
                             if not self._move(dx, dy, stop):
-                                break  # не дождались lock из-за stop: движения не было
+                                break
                             ox += dx
                             oy += dy
                         self._carry = (wx - dx, wy - dy)
-                        # дедлайн, а не sleep(delay): время move() не накапливается
                         next_t += delay
                         wait = next_t - time.perf_counter()
                         if wait > 0.05:
@@ -284,14 +286,13 @@ class JitterController:
                         elif wait > 0:
                             time.sleep(wait)
                         else:
-                            next_t = time.perf_counter()  # отстали, не наверстываем
+                            next_t = time.perf_counter()
                     else:
-                        ox = oy = 0  # цикл завершён целиком, откатывать нечего
+                        ox = oy = 0
                 except Exception:
                     failed = True
                     log.exception("WebShaker error")
                 finally:
-                    # остановка или ошибка посреди цикла: откатываем недоделанную часть
                     self._rollback(ox, oy)
                 if failed:
                     stop.wait(0.5)
@@ -301,40 +302,34 @@ class JitterController:
                 _timer_end()
 
     def start(self):
-        """True, если поток работает после вызова; False, если запуск отказан
-        (предыдущий поток ещё не завершился после stop())."""
+        """True, если поток работает после вызова; False, если запуск отказан."""
         with self._lifecycle_lock:
             t = self._thread
             if t is not None and t.is_alive():
                 if not self._stop.is_set():
-                    return True  # уже работает
+                    return True
                 if t is not threading.current_thread():
-                    t.join(timeout=START_JOIN_TIMEOUT)   # коротко: звать из цикла кадров
+                    t.join(timeout=START_JOIN_TIMEOUT)
                 if t.is_alive():
                     log.warning("jitter: previous thread still stopping, start refused "
                                 "(повторите start() на следующем кадре)")
                     return False
-            self._refresh_from_config()             # сеттеры до start() больше не затираются
+            self._refresh_from_config()
             self._carry = (0.0, 0.0)
-            self._stop = threading.Event()          # новый Event на каждый запуск
+            self._stop = threading.Event()
             self._thread = threading.Thread(
                 target=self._loop, args=(self._stop,), daemon=True, name="JitterThread")
             self._thread.start()
             return True
 
     def request_stop(self):
-        """НЕ блокирует: только просит поток остановиться (Event.set) и сразу возвращается.
-        Звать из цикла кадров. Поток сам откатит недоделанный цикл и выйдет (обычно за мс).
-        Возвращает True, если поток уже не работает. Не берёт _lifecycle_lock: не зависнет,
-        даже если другой поток сейчас ждёт join в stop()."""
+        """НЕ блокирует: только просит поток остановиться."""
         self._stop.set()
         t = self._thread
         return t is None or not t.is_alive()
 
     def stop(self, wait=True):
-        """wait=True: True, если поток завершился; False, если не успел за STOP_JOIN_TIMEOUT
-        (или stop() вызван из самого потока: остановка запрошена, но выход не гарантирован).
-        wait=False: то же, что request_stop() (не блокирует)."""
+        """wait=True: ждёт завершения. wait=False: то же, что request_stop()."""
         if not wait:
             return self.request_stop()
         with self._lifecycle_lock:
