@@ -71,14 +71,15 @@ class Aimbot:
         self.aim_thread = None
 
         self.frame_queue = queue.Queue(maxsize=1)
-        self.smooth_move_queue = queue.Queue(maxsize=10)
+        # Увеличили до 100: буфер вмещает и smooth-траектории, и шаги джиттера
+        self.smooth_move_queue = queue.Queue(maxsize=100)
 
         self.makcu = None
         self._owns_makcu = False
-        
-        # УДАЛЕНО: self._makcu_lock больше не нужен. smooth_movement_loop - единственный владелец.
-        
+        # Общий lock: синхронизирует smooth_movement_loop и JitterController
+        self._makcu_lock = threading.Lock()
         self.jitter_controller = None
+
         self.model = None
         self.class_names = {}
 
@@ -100,16 +101,16 @@ class Aimbot:
         self._jitter_deactivate_ts = 0.0
         self._last_frame_ts = 0.0
         self._frame_dt = 0.014
-        
+
         # Для компенсации ego_shift
         self._last_aim_dx = 0.0
         self._last_aim_dy = 0.0
 
-        # 4. ОПТИМИЗАЦИЯ: Кэширование distance_multiplier (вычисляется 1 раз)
+        # ОПТИМИЗАЦИЯ 1: Кэширование distance_multiplier (вычисляется 1 раз)
         sens = getattr(config, 'in_game_sens', 1.5)
         self._distance_multiplier = 1.07437623 * math.pow(sens, -0.9936827126)
 
-        # 3. ОПТИМИЗАЦИЯ: Флаги для безопасной инициализации OpenCV вне цикла
+        # ОПТИМИЗАЦИЯ 2: Флаги для безопасной инициализации OpenCV вне цикла
         self._debug_window_initialized = False
         self._debug_win_name = "AI Debug"
 
@@ -134,7 +135,7 @@ class Aimbot:
             aim_smear_s=getattr(config, 'aim_smear_s', 0.04)
         )
 
-        # Передаем ВСЕ параметры из конфига, чтобы они реально применялись
+        # Передаём ВСЕ параметры из конфига, чтобы они реально применялись
         lock_cfg = LockConfig.recommended(
             lost_frames=getattr(config, 'lock_lost_frames', 15),
             match_radius=getattr(config, 'lock_match_radius', 0.1),
@@ -176,32 +177,67 @@ class Aimbot:
     def _now_ms(self):
         return time.perf_counter() * 1000.0
 
-    # 2. ОПТИМИЗАЦИЯ: Убраны self._makcu_lock. Этот метод вызывается ТОЛЬКО из smooth_movement_loop
+    # Вызывается ТОЛЬКО из smooth_movement_loop — единственный владелец makcu
     def _locked_move(self, dx, dy):
-        if self.makcu is not None:
+        if self.makcu is None:
+            return
+        t0 = time.perf_counter()
+        with self._makcu_lock:
+            wait_ms = (time.perf_counter() - t0) * 1000.0
+            if wait_ms > 2.0:
+                self._lock_waits += 1
             self.makcu.move(dx, dy)
 
     def _locked_click(self):
-        if self.makcu is not None:
+        if self.makcu is None:
+            return
+        t0 = time.perf_counter()
+        with self._makcu_lock:
+            wait_ms = (time.perf_counter() - t0) * 1000.0
+            if wait_ms > 2.0:
+                self._lock_waits += 1
             self.makcu.click()
 
     def smooth_movement_loop(self):
+        """Единственный поток, обращающийся к makcu. Агрегирует микро-смещения."""
         logger.info("Smooth movement thread started (Sole owner of makcu)")
         while not self.stop_event.is_set():
             try:
-                move_data = self.smooth_move_queue.get(timeout=0.05)
-                dx, dy, delay = move_data
-                
-                if self.makcu is not None:
-                    self._locked_move(dx, dy)
-                
+                # Блокирующее ожидание первого элемента (экономит CPU)
+                dx, dy, delay = self.smooth_move_queue.get()
+
                 if delay > 0:
+                    # Элемент с задержкой — отправляем как есть
+                    if dx != 0 or dy != 0:
+                        self._locked_move(dx, dy)
                     time.sleep(delay)
-            except queue.Empty:
-                continue
+                    continue
+
+                # Элемент без задержки — агрегируем с последующими
+                sum_dx, sum_dy = dx, dy
+                while True:
+                    try:
+                        ndx, ndy, ndelay = self.smooth_move_queue.get_nowait()
+                        if ndelay > 0:
+                            # Нашли элемент с задержкой — отправляем накопленное
+                            if sum_dx != 0 or sum_dy != 0:
+                                self._locked_move(sum_dx, sum_dy)
+                            # Отправляем элемент с задержкой
+                            if ndx != 0 or ndy != 0:
+                                self._locked_move(ndx, ndy)
+                            time.sleep(ndelay)
+                            break
+                        else:
+                            sum_dx += ndx
+                            sum_dy += ndy
+                    except queue.Empty:
+                        # Очередь пуста — отправляем накопленное
+                        if sum_dx != 0 or sum_dy != 0:
+                            self._locked_move(sum_dx, sum_dy)
+                        break
             except Exception as e:
                 logger.error(f"Smooth movement failed: {e}")
-                time.sleep(0.01)
+                time.sleep(0.001)
         logger.info("Smooth movement thread stopped")
 
     def capture_loop(self):
@@ -255,12 +291,12 @@ class Aimbot:
             pass
         logger.info("Capture loop stopped")
 
-    # 1. и 2. ОПТИМИЗАЦИЯ: Полностью неблокирующая отправка в очередь. Восстановлены bezier/silent.
     def _apply_movement_mode(self, dx, dy, frame_count, best_target=None):
+        """Все режимы пушат задачи в smooth_move_queue (Zero-Lock)."""
         if config.mode == "normal":
             dt = self._frame_dt
             dist_px = math.hypot(dx, dy)
-            
+
             if dist_px > 80: base_gain = 0.55
             elif dist_px > 40: base_gain = 0.45
             elif dist_px > 15: base_gain = 0.35
@@ -270,7 +306,7 @@ class Aimbot:
             tau_y = 0.010 / max(config.normal_y_speed, 0.01)
             gain_x = min(1.0 - math.exp(-dt / tau_x), base_gain)
             gain_y = min(1.0 - math.exp(-dt / tau_y), base_gain)
-            
+
             dx *= gain_x
             dy *= gain_y
 
@@ -289,9 +325,12 @@ class Aimbot:
                     pass
 
         elif config.mode == "bezier":
-            # Предрасчет траектории в потоке инференса (Zero-Lock)
-            # Примечание: убедись, что smooth_aimer имеет метод calculate_bezier_path, возвращающий список
-            path = getattr(smooth_aimer, 'calculate_bezier_path', lambda dx, dy, cfg: [(dx, dy, 0.0)])(dx, dy, config)
+            # Предрасчёт траектории в потоке инференса (Zero-Lock)
+            path_fn = getattr(smooth_aimer, 'calculate_bezier_path', None)
+            if path_fn is None:
+                path = [(dx, dy, 0.0)]
+            else:
+                path = path_fn(dx, dy, config)
             for move_dx, move_dy, delay in path:
                 try:
                     self.smooth_move_queue.put_nowait((move_dx, move_dy, delay))
@@ -299,7 +338,11 @@ class Aimbot:
                     break
 
         elif config.mode == "silent":
-            path = getattr(smooth_aimer, 'calculate_silent_path', lambda dx, dy, cfg: [(dx, dy, 0.0)])(dx, dy, config)
+            path_fn = getattr(smooth_aimer, 'calculate_silent_path', None)
+            if path_fn is None:
+                path = [(dx, dy, 0.0)]
+            else:
+                path = path_fn(dx, dy, config)
             for move_dx, move_dy, delay in path:
                 try:
                     self.smooth_move_queue.put_nowait((move_dx, move_dy, delay))
@@ -313,8 +356,8 @@ class Aimbot:
                     self.smooth_move_queue.put_nowait((move_dx, move_dy, delay))
                 except queue.Full:
                     break
-        
-        # Сохраняем исходное движение (до deadzone/сглаживания) для точного расчета ego_shift
+
+        # Сохраняем исходное движение для точного расчёта ego_shift
         self._last_aim_dx = dx
         self._last_aim_dy = dy
 
@@ -335,10 +378,12 @@ class Aimbot:
             if not self.jitter_controller.is_active:
                 self.jitter_controller.update_params()
                 if not self.jitter_controller.start():
-                    pass 
+                    pass  # Поток ещё останавливается, повторим на следующем кадре
                 else:
                     logger.info("JITTER START | pattern=%s amp=%d/%d",
-                                self.jitter_controller.pattern, self.jitter_controller.amp_x, self.jitter_controller.amp_y)
+                                self.jitter_controller.pattern,
+                                self.jitter_controller.amp_x,
+                                self.jitter_controller.amp_y)
         else:
             if self._jitter_deactivate_ts == 0.0:
                 self._jitter_deactivate_ts = now
@@ -396,22 +441,22 @@ class Aimbot:
                 aim_margin_px=self.detector_config.aim_margin_px,
                 ref_center=(ref_cx, ref_cy)
             )
-            
+
             debug_img = image.copy() if config.show_debug_window else None
             result = detect(self.model, image, self.class_names, current_config)
-            
+
             if debug_img is not None:
                 draw_debug_overlay(debug_img, result)
 
             raw_button_held = is_button_pressed(config.selected_mouse_button)
-            
+
             ego_shift = self.ego_tracker.update(
                 aim_move=(self._last_aim_dx, self._last_aim_dy),
                 t=t_frame
             )
-            
+
             life_result = self.lifecycle.update(
-                result.entities, image.shape[:2], raw_button_held, 
+                result.entities, image.shape[:2], raw_button_held,
                 ego_shift=ego_shift, t=t_frame
             )
 
@@ -419,28 +464,34 @@ class Aimbot:
             lock_status = life_result.status
             button_held = life_result.held
 
-            # Блок калибровки (оставлен для финальной сверки)
-            if lock_status == LockStatus.TRACKING and best_target is not None and self._last_best_center is not None:
+            # Временный блок калибровки ego_px_per_unit
+            if (lock_status == LockStatus.TRACKING
+                    and best_target is not None
+                    and self._last_best_center is not None):
                 dx_calib = best_target.poi[0] - self._last_best_center[0]
                 dy_calib = best_target.poi[1] - self._last_best_center[1]
-                logger.info(f"EGO | dx={dx_calib:.1f} dy={dy_calib:.1f} | mx={self._last_aim_dx:.2f} my={self._last_aim_dy:.2f} | dt={self._frame_dt*1000:.1f}ms")
+                logger.info(
+                    f"EGO | dx={dx_calib:.1f} dy={dy_calib:.1f} | "
+                    f"mx={self._last_aim_dx:.2f} my={self._last_aim_dy:.2f} | "
+                    f"dt={self._frame_dt * 1000:.1f}ms"
+                )
 
             if best_target:
                 cx, cy = best_target.poi
                 self._last_dist = best_target.distance_px
                 self._last_target_ts = t_frame
-                
+
                 if lock_status == LockStatus.TRACKING:
                     self._last_best_center = (cx, cy)
                     self._had_target = True
                 elif lock_status == LockStatus.COASTING:
-                    pass 
+                    pass
             else:
                 if self._had_target:
                     pass
                 self._had_target = False
                 self._last_best_center = None
-                
+
                 if t_frame - self._last_target_ts > 0.20:
                     smooth_aimer.reset_fatigue()
                     self.ema_target_x = None
@@ -451,32 +502,32 @@ class Aimbot:
             if best_target:
                 tx, ty = best_target.poi
                 box_height = best_target.height
-                
+
                 if self.ema_target_x is None:
                     self.ema_target_x, self.ema_target_y = tx, ty
                 else:
                     jump_dist = math.hypot(tx - self.ema_target_x, ty - self.ema_target_y)
-                    
-                    # 3. ОПТИМИЗАЦИЯ: Плавная EMA вместо ступенчатого if/else
+
+                    # ОПТИМИЗАЦИЯ 3: Плавная EMA (линейная интерполяция)
                     max_dist = 20.0
                     min_alpha, max_alpha = 0.15, 0.85
                     raw_alpha = min_alpha + (max_alpha - min_alpha) * min(jump_dist / max_dist, 1.0)
-                    
+
                     if box_height < 60 and jump_dist > 2.0:
                         raw_alpha = max(raw_alpha, 0.85)
-                        
+
                     alpha = max(min_alpha, min(max_alpha, raw_alpha))
-                    
+
                     self.ema_target_x = alpha * tx + (1 - alpha) * self.ema_target_x
                     self.ema_target_y = alpha * ty + (1 - alpha) * self.ema_target_y
 
                 target_screen_x = region_left + self.ema_target_x
                 target_screen_y = region_top + self.ema_target_y
-                
-                # 4. ОПТИМИЗАЦИЯ: Используем закэшированный множитель
+
+                # ОПТИМИЗАЦИЯ 4: Используем закэшированный множитель
                 raw_dx = (target_screen_x - crosshair_x) * self._distance_multiplier
                 raw_dy = (target_screen_y - crosshair_y) * self._distance_multiplier
-                
+
                 self._apply_movement_mode(raw_dx, raw_dy, frame_count, best_target)
             else:
                 if t_frame - self._last_target_ts > 0.20:
@@ -488,7 +539,7 @@ class Aimbot:
 
             self._process_jitter(button_held)
 
-            # 5. ОПТИМИЗАЦИЯ: Безопасная отрисовка OpenCV без утечек GDI + Fix NameError
+            # ОПТИМИЗАЦИЯ 5: Безопасная отрисовка OpenCV без утечек GDI
             if config.show_debug_window and debug_img is not None and result.entities:
                 if not self._debug_window_initialized:
                     cv2.namedWindow(self._debug_win_name, cv2.WINDOW_AUTOSIZE)
@@ -496,10 +547,11 @@ class Aimbot:
                     y = (config.screen_height - debug_img.shape[0]) // 2
                     cv2.moveWindow(self._debug_win_name, x, y)
                     self._debug_window_initialized = True
-                
+
                 cv2.imshow(self._debug_win_name, debug_img)
                 cv2.waitKey(1)
 
+            # Статистика FPS
             frame_ms = (time.perf_counter() - t_frame) * 1000.0
             self._frame_ms_ema = frame_ms if not self._frame_ms_ema else 0.9 * self._frame_ms_ema + 0.1 * frame_ms
             if frame_ms > 35.0:
@@ -560,12 +612,16 @@ class Aimbot:
         self.aim_thread.start()
 
         if self.jitter_controller is None:
-            # Передаем очередь в джиттер, чтобы он тоже стал частью Zero-Lock Pipeline
-            self.jitter_controller = JitterController(self.makcu, move_queue=self.smooth_move_queue)
+            # Передаём общий lock и очередь: джиттер становится частью Zero-Lock Pipeline
+            self.jitter_controller = JitterController(
+                self.makcu,
+                makcu_lock=self._makcu_lock,
+                move_queue=self.smooth_move_queue
+            )
 
         self._running = True
         _aimbot_running = True
-        
+
         # Вывод конфигурации в лог при старте
         log_startup_config(
             self.target_lock.config,
@@ -573,7 +629,7 @@ class Aimbot:
             ego=self.ego_tracker,
             logger=logger
         )
-        
+
         logger.info(f"Aimbot started in {config.mode} mode.")
 
     def stop(self):
@@ -630,20 +686,24 @@ class Aimbot:
 # === Глобальные функции управления ===
 _aimbot_instance = None
 
+
 def start_aimbot():
     global _aimbot_instance
     if _aimbot_instance is None:
         _aimbot_instance = Aimbot()
     _aimbot_instance.start()
 
+
 def stop_aimbot():
     global _aimbot_instance
     if _aimbot_instance is not None:
         _aimbot_instance.stop()
 
+
 def is_aimbot_running():
     global _aimbot_instance
     return _aimbot_instance is not None and _aimbot_instance.is_running()
+
 
 def reload_model(path=None):
     global _aimbot_instance
@@ -651,12 +711,14 @@ def reload_model(path=None):
         return _aimbot_instance.reload_model(path)
     return load_model(path or config.model_path)
 
+
 def get_model_classes(path=None):
     global _aimbot_instance
     if _aimbot_instance is not None:
         return _aimbot_instance.get_model_classes(path)
     _, class_names = load_model(path or config.model_path)
     return [class_names[i] for i in sorted(class_names.keys())]
+
 
 def get_model_size(path=None):
     global _aimbot_instance
@@ -667,9 +729,11 @@ def get_model_size(path=None):
     except Exception:
         return "?"
 
+
 def get_fps():
     global _aimbot_instance
     return _aimbot_instance.fps if _aimbot_instance else 0
+
 
 __all__ = [
     'start_aimbot', 'stop_aimbot', 'is_aimbot_running', 'reload_model',
