@@ -75,7 +75,8 @@ class Aimbot:
 
         self.makcu = None
         self._owns_makcu = False
-        # УБРАНО: self._makcu_lock больше не нужен, так как только один поток обращается к makcu
+        
+        # УДАЛЕНО: self._makcu_lock больше не нужен. smooth_movement_loop - единственный владелец.
         
         self.jitter_controller = None
         self.model = None
@@ -133,6 +134,7 @@ class Aimbot:
             aim_smear_s=getattr(config, 'aim_smear_s', 0.04)
         )
 
+        # Передаем ВСЕ параметры из конфига, чтобы они реально применялись
         lock_cfg = LockConfig.recommended(
             lost_frames=getattr(config, 'lock_lost_frames', 15),
             match_radius=getattr(config, 'lock_match_radius', 0.1),
@@ -174,7 +176,7 @@ class Aimbot:
     def _now_ms(self):
         return time.perf_counter() * 1000.0
 
-    # 2. ОПТИМИЗАЦИЯ: Убраны self._makcu_lock. Этот метод теперь вызывается ТОЛЬКО из smooth_movement_loop
+    # 2. ОПТИМИЗАЦИЯ: Убраны self._makcu_lock. Этот метод вызывается ТОЛЬКО из smooth_movement_loop
     def _locked_move(self, dx, dy):
         if self.makcu is not None:
             self.makcu.move(dx, dy)
@@ -253,10 +255,8 @@ class Aimbot:
             pass
         logger.info("Capture loop stopped")
 
-    # 1. и 2. ОПТИМИЗАЦИЯ: Полностью неблокирующая отправка в очередь. Никаких lock.
+    # 1. и 2. ОПТИМИЗАЦИЯ: Полностью неблокирующая отправка в очередь. Восстановлены bezier/silent.
     def _apply_movement_mode(self, dx, dy, frame_count, best_target=None):
-        final_dx, final_dy = 0.0, 0.0
-        
         if config.mode == "normal":
             dt = self._frame_dt
             dist_px = math.hypot(dx, dy)
@@ -282,33 +282,41 @@ class Aimbot:
                 dy *= k
 
             final_dx, final_dy = self.deadzone.apply(dx, dy)
+            if final_dx != 0.0 or final_dy != 0.0:
+                try:
+                    self.smooth_move_queue.put_nowait((final_dx, final_dy, 0.0))
+                except queue.Full:
+                    pass
 
         elif config.mode == "bezier":
-            # Для упрощения конвейера bezier тоже считает финальные координаты и отправляет в очередь
-            # (Внутренняя логика bezier может быть адаптирована под этот паттерн)
-            final_dx, final_dy = dx, dy 
+            # Предрасчет траектории в потоке инференса (Zero-Lock)
+            # Примечание: убедись, что smooth_aimer имеет метод calculate_bezier_path, возвращающий список
+            path = getattr(smooth_aimer, 'calculate_bezier_path', lambda dx, dy, cfg: [(dx, dy, 0.0)])(dx, dy, config)
+            for move_dx, move_dy, delay in path:
+                try:
+                    self.smooth_move_queue.put_nowait((move_dx, move_dy, delay))
+                except queue.Full:
+                    break
+
         elif config.mode == "silent":
-            final_dx, final_dy = dx, dy
+            path = getattr(smooth_aimer, 'calculate_silent_path', lambda dx, dy, cfg: [(dx, dy, 0.0)])(dx, dy, config)
+            for move_dx, move_dy, delay in path:
+                try:
+                    self.smooth_move_queue.put_nowait((move_dx, move_dy, delay))
+                except queue.Full:
+                    break
+
         elif config.mode == "smooth":
-            # smooth уже работает через очередь, но для унификации:
             path = smooth_aimer.calculate_smooth_path(dx, dy, config)
             for move_dx, move_dy, delay in path:
                 try:
                     self.smooth_move_queue.put_nowait((move_dx, move_dy, delay))
                 except queue.Full:
                     break
-            return # Если smooth, мы уже заполнили очередь, выходим
-
-        # Отправка в очередь БЕЗ блокировок (Zero-lock pipeline)
-        if final_dx != 0.0 or final_dy != 0.0:
-            try:
-                self.smooth_move_queue.put_nowait((final_dx, final_dy, 0.0))
-            except queue.Full:
-                pass # Пропускаем кадр, если очередь переполнена, чтобы не тормозить инференс
-
-        # Сохраняем для ego_shift
-        self._last_aim_dx = final_dx
-        self._last_aim_dy = final_dy
+        
+        # Сохраняем исходное движение (до deadzone/сглаживания) для точного расчета ego_shift
+        self._last_aim_dx = dx
+        self._last_aim_dy = dy
 
     def _process_jitter(self, button_held: bool):
         if not getattr(config, 'jitter_enabled', False) or not self.jitter_controller:
@@ -413,9 +421,9 @@ class Aimbot:
 
             # Блок калибровки (оставлен для финальной сверки)
             if lock_status == LockStatus.TRACKING and best_target is not None and self._last_best_center is not None:
-                dx = best_target.poi[0] - self._last_best_center[0]
-                dy = best_target.poi[1] - self._last_best_center[1]
-                logger.info(f"EGO | dx={dx:.1f} dy={dy:.1f} | mx={self._last_aim_dx:.2f} my={self._last_aim_dy:.2f} | dt={self._frame_dt*1000:.1f}ms")
+                dx_calib = best_target.poi[0] - self._last_best_center[0]
+                dy_calib = best_target.poi[1] - self._last_best_center[1]
+                logger.info(f"EGO | dx={dx_calib:.1f} dy={dy_calib:.1f} | mx={self._last_aim_dx:.2f} my={self._last_aim_dy:.2f} | dt={self._frame_dt*1000:.1f}ms")
 
             if best_target:
                 cx, cy = best_target.poi
@@ -480,8 +488,8 @@ class Aimbot:
 
             self._process_jitter(button_held)
 
-            # 5. ОПТИМИЗАЦИЯ: Безопасная отрисовка OpenCV без утечек GDI
-            if config.show_debug_window and result.entities:
+            # 5. ОПТИМИЗАЦИЯ: Безопасная отрисовка OpenCV без утечек GDI + Fix NameError
+            if config.show_debug_window and debug_img is not None and result.entities:
                 if not self._debug_window_initialized:
                     cv2.namedWindow(self._debug_win_name, cv2.WINDOW_AUTOSIZE)
                     x = (config.screen_width - debug_img.shape[1]) // 2
@@ -552,7 +560,8 @@ class Aimbot:
         self.aim_thread.start()
 
         if self.jitter_controller is None:
-            self.jitter_controller = JitterController(self.makcu) # Убран lock из инициализации
+            # Передаем очередь в джиттер, чтобы он тоже стал частью Zero-Lock Pipeline
+            self.jitter_controller = JitterController(self.makcu, move_queue=self.smooth_move_queue)
 
         self._running = True
         _aimbot_running = True
