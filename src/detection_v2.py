@@ -114,7 +114,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 
-__version__ = "2.12.0"
+__version__ = "2.12.1"
 
 __all__ = [
     "DeadzoneFilter", "Category", "TrackedEntity", "DetectionResult", "DetectorConfig",
@@ -1047,6 +1047,12 @@ class EgoTracker:
         self._t_prev: Optional[float] = None
         # [t_движения, mx, my]: движения, чей отклик ещё не пришёл целиком
         self._pending: list[list[float]] = []
+
+    def set_jitter_offset(self, jitter_offset: Optional[Callable[[float], tuple[float, float]]]) -> None:
+        """Подключить (или отключить) джиттер ПОСЛЕ создания трекера: контроллер часто создают позже
+        (например, в start()). Передайте jitter.offset_at; None - не учитывать джиттер."""
+        self._jitter = jitter_offset
+        self._last = None
 
     def reset(self) -> None:
         """Забыть прошлое смещение джиттера и ещё не пришедший отклик на наведение."""
